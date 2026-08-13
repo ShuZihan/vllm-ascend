@@ -33,7 +33,8 @@ def test_indexer_dcp_golden_smoke():
 
     需要 NPU 硬件。对齐生产实际路径（torch_npu.npu_lightning_indexer，
     非 C8 分支——rc1 上 enable_sparse_li_c8 因 layer_name bug 永不生效）。
-    默认输入 B=8、index_n_heads=32、head_dim=128、seq_len=131072、dtype=bf16。
+    默认输入 B=8、index_n_heads=32、head_dim=128、seq_len=131072、
+    dtype=bf16。
     """
     inputs = create_indexer_inputs(seed=0)
 
