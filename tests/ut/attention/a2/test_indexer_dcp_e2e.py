@@ -29,6 +29,9 @@ from tests.ut.attention.utils import (  # noqa: E402
     make_sfa_impl_stub,
 )
 from vllm_ascend.device.device_op import DeviceOperator  # noqa: E402
+from vllm_ascend.utils import enable_custom_op  # noqa: E402
+
+enable_custom_op()
 
 
 def test_indexer_dcp_golden_smoke():
