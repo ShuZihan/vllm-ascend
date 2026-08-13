@@ -55,4 +55,5 @@ def test_indexer_dcp_golden_smoke():
     # （中间为单 head 维；下游 IndexCache 亦按 3 维消费）
     assert indices.shape == (8, 1, 2048)
     assert indices.dtype == torch.int32
-    assert values.shape == (8, 1, 2048)
+    # torch_npu 2.10 的该内核不输出分数：第二返回值为空张量（真机实测）
+    assert values.numel() == 0
