@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import wraps
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -339,3 +340,141 @@ def create_and_prepopulate_kv_cache(
         )
 
     return kv_cache
+
+
+@dataclass
+class C8IndexerInputs:
+    """GLM-5.2 C8 Indexer golden 输入。
+
+    形状与 device_op.py indexer_select_post_process 一致。
+    布局配套约束：stub 的 enable_sparse_sfa_c8=True 时，kv_cache 必须是
+    packed 3 元素布局 (packed_kv, indexer_k, indexer_scale)——
+    indexer K/scale 分别位于 kv_cache[1]/kv_cache[2]。
+    """
+
+    q_li: torch.Tensor          # int8  [T, num_heads, head_dim]
+    q_li_scale: torch.Tensor    # fp16  [T, num_heads]
+    q_li_shape_ori: tuple       # (T, num_heads, head_dim)
+    weights: torch.Tensor       # fp16  [T, num_heads]
+    kv_cache: tuple             # (packed_kv, indexer_k, indexer_scale)
+    attn_metadata: object       # 仅需 .block_table
+    actual_seq_lengths_query: torch.Tensor  # int32 [B]
+    actual_seq_lengths_key: torch.Tensor    # int32 [B]
+
+
+def make_sfa_impl_stub(
+    *,
+    enable_sparse_sfa_c8: bool = True,
+    use_torch_npu_lightning_indexer: bool = True,
+) -> object:
+    """构造 device_op 所需的 sfa_impl 替身（只含被读取的两个属性）。
+
+    默认值对应 GLM-5.2-W4A8C8 的 C8 场景：
+    - use_torch_npu_lightning_indexer=True：glm_moe_dsa 在 sfa_v1.py 硬编码
+    - enable_sparse_sfa_c8=True：启动配置显式开启（ascend_config.py），
+      且必须与 kv_cache 的 packed 3 元素布局配套。
+    """
+    return SimpleNamespace(
+        enable_sparse_sfa_c8=enable_sparse_sfa_c8,
+        use_torch_npu_lightning_indexer=use_torch_npu_lightning_indexer,
+    )
+
+
+def create_c8_indexer_inputs(
+    num_requests: int = 8,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    seq_len: int = 131072,
+    query_len: int = 1,
+    block_size: int = 128,
+    device: str = "npu",
+    seed: int | None = None,
+) -> C8IndexerInputs:
+    """构造 C8 Indexer golden 的随机量化形态输入。
+
+    GLM-5.2：index_n_heads=32, index_head_dim=128。
+    形状依据：
+    - q_li/q_li_scale：C8 量化后 [T, heads, dim] int8 + [T, heads] fp16
+      （sfa_v1.py indexer_select_post_process 量化 + view 回 q_li_shape_ori）
+    - indexer_k：int8 [num_blocks, block_size, 1, head_dim]（PA_BSND paged）
+    - indexer_scale：fp16 [num_blocks, block_size, 1, 1]——device_op 中
+      squeeze(2) 后为 3 维，与内核 CheckScaleShape 要求
+      （key 前 3 维一致）相符
+    - weights：fp16 [T, heads]
+      （wk_weights_proj 输出 [T, head_dim+heads] 的后半）
+
+    Args:
+        num_requests: 请求数 B（T = num_requests × query_len）
+        num_heads: indexer head 数（GLM-5.2 = 32）
+        head_dim: indexer head 维（GLM-5.2 = 128）
+        seq_len: 每请求 key 长度（完整 K）
+        query_len: 每请求 query 数（decode = 1）
+        block_size: KV cache block 大小
+        device: 张量设备（默认 "npu"，真机测试用）
+        seed: 可选随机种子
+
+    Returns:
+        C8IndexerInputs：可直接传入
+        DeviceOperator.indexer_select_post_process 的输入集
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    num_tokens = num_requests * query_len
+    num_blocks_per_req = cdiv(seq_len, block_size)
+    num_blocks = num_requests * num_blocks_per_req
+
+    # q_li 与 scale：C8 量化形态（per-token-head，即每行一个 scale）
+    q_li = torch.randint(
+        -128, 127, (num_tokens, num_heads, head_dim),
+        dtype=torch.int8, device=device,
+    )
+    q_li_scale = (
+        torch.rand(num_tokens, num_heads, dtype=torch.float16, device=device)
+        + 0.01
+    )
+    q_li_shape_ori = (num_tokens, num_heads, head_dim)
+
+    # weights：per-token per-head 的 indexer 权重
+    weights = torch.randn(
+        num_tokens, num_heads, dtype=torch.float16, device=device
+    )
+
+    # indexer K cache（paged）与 per-position scale（每位置 1 个 fp16 标量）
+    indexer_k = torch.randint(
+        -128, 127, (num_blocks, block_size, 1, head_dim),
+        dtype=torch.int8, device=device,
+    )
+    indexer_scale = (
+        torch.rand(
+            num_blocks, block_size, 1, 1, dtype=torch.float16, device=device
+        )
+        + 0.01
+    )
+    # kv_cache[0]（packed SFA KV）：indexer 路径不使用，占位
+    packed_kv = torch.empty((0,), dtype=torch.int8, device=device)
+    kv_cache = (packed_kv, indexer_k, indexer_scale)
+
+    # block_table：每请求顺序分配 num_blocks_per_req 个物理块
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        num_requests, num_blocks_per_req
+    )
+    attn_metadata = SimpleNamespace(block_table=block_table)
+
+    actual_seq_lengths_query = torch.full(
+        (num_requests,), query_len, dtype=torch.int32, device=device
+    )
+    actual_seq_lengths_key = torch.full(
+        (num_requests,), seq_len, dtype=torch.int32, device=device
+    )
+
+    return C8IndexerInputs(
+        q_li=q_li,
+        q_li_scale=q_li_scale,
+        q_li_shape_ori=q_li_shape_ori,
+        weights=weights,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+    )
