@@ -20,42 +20,36 @@ import sys
 from unittest.mock import MagicMock
 
 import torch
+import torch_npu  # noqa: F401
 
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
-from tests.ut.attention.utils import (  # noqa: E402
-    create_c8_indexer_inputs,
-    make_sfa_impl_stub,
-)
-from vllm_ascend.device.device_op import DeviceOperator  # noqa: E402
-from vllm_ascend.utils import enable_custom_op  # noqa: E402
-
-enable_custom_op()
+from tests.ut.attention.utils import create_indexer_inputs  # noqa: E402
 
 
 def test_indexer_dcp_golden_smoke():
-    """golden 链路 smoke：输入构造 → 内核调用 → 输出形状/类型。
+    """golden 链路 smoke：输入构造 → 非 C8 indexer 内核 → 输出形状/类型。
 
-    需要 NPU 硬件（C8 内核 npu_lightning_indexer_quant）。
-    默认输入 B=8、index_n_heads=32、head_dim=128、seq_len=131072。
+    需要 NPU 硬件。对齐生产实际路径（torch_npu.npu_lightning_indexer，
+    非 C8 分支——rc1 上 enable_sparse_li_c8 因 layer_name bug 永不生效）。
+    默认输入 B=8、index_n_heads=32、head_dim=128、seq_len=131072、dtype=bf16。
     """
-    inputs = create_c8_indexer_inputs(seed=0)
-    stub = make_sfa_impl_stub()
+    inputs = create_indexer_inputs(seed=0)
 
-    out = DeviceOperator.indexer_select_post_process(
-        stub,
-        inputs.q_li,
-        inputs.q_li_scale,
-        inputs.q_li_shape_ori,
-        inputs.weights,
-        inputs.kv_cache,
-        inputs.attn_metadata,
-        inputs.actual_seq_lengths_query,
-        inputs.actual_seq_lengths_key,
-        enable_sparse_li_c8=True,
-        use_torch_npu_lightning_indexer=True,
+    indices, values = torch_npu.npu_lightning_indexer(
+        query=inputs.q_li,
+        key=inputs.indexer_k,
+        weights=inputs.weights,
+        actual_seq_lengths_query=inputs.actual_seq_lengths_query,
+        actual_seq_lengths_key=inputs.actual_seq_lengths_key,
+        block_table=inputs.block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=2048,
+        sparse_mode=3,
     )
 
-    assert out.shape == (8, 2048)
-    assert out.dtype == torch.int32
+    assert indices.shape == (8, 2048)
+    assert indices.dtype == torch.int32
+    assert values.shape == (8, 2048)
