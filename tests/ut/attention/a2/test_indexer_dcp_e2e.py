@@ -29,7 +29,7 @@ from tests.ut.attention.utils import create_indexer_inputs  # noqa: E402
 
 
 def test_indexer_dcp_golden_smoke():
-    """golden 链路 smoke：输入构造 → 非 C8 indexer 内核 → 输出形状/类型。
+    """golden 链路 smoke：输入构造 → 非 C8 内核 → 输出形状/类型。
 
     需要 NPU 硬件。对齐生产实际路径（torch_npu.npu_lightning_indexer，
     非 C8 分支——rc1 上 enable_sparse_li_c8 因 layer_name bug 永不生效）。
